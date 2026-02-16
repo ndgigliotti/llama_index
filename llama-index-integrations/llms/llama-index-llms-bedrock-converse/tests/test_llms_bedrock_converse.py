@@ -2,6 +2,7 @@ import random
 import string
 import json
 import os
+from pydantic import BaseModel, Field as PydanticField
 from llama_index.core.base.llms.types import ImageBlock, TextBlock
 import pytest
 from llama_index.llms.bedrock_converse import BedrockConverse
@@ -18,9 +19,11 @@ from llama_index.core.base.llms.types import (
     ToolCallBlock,
 )
 from llama_index.core.callbacks import CallbackManager
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.tools import FunctionTool
 from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent
 from llama_index.core.workflow import Context
+from llama_index.core.types import PydanticProgramMode
 from PIL import Image
 import io
 import numpy as np
@@ -1297,3 +1300,380 @@ async def test_tool_call_input_output(
         for block in ablocks
         if isinstance(block, ToolCallBlock)
     )
+
+
+# --- Structured Predict Tests ---
+
+
+class SampleOutputModel(BaseModel):
+    """Test output model."""
+
+    name: str = PydanticField(description="A name")
+    age: int = PydanticField(description="An age")
+
+
+STRUCTURED_JSON_RESPONSE = '{"name": "Alice", "age": 30}'
+STRUCTURED_STREAM_CHUNKS = ['{"name":', ' "Alice",', ' "age":', " 30}"]
+
+
+class MockStructuredClient:
+    """Mock client that returns JSON text responses for structured output tests."""
+
+    def __init__(self) -> None:
+        self.exceptions = MockExceptions()
+        self.last_converse_kwargs = None
+
+    def converse(self, *args, **kwargs):
+        self.last_converse_kwargs = kwargs
+        return {
+            "output": {"message": {"content": [{"text": STRUCTURED_JSON_RESPONSE}]}},
+            "usage": {"inputTokens": 10, "outputTokens": 20, "totalTokens": 30},
+        }
+
+    def converse_stream(self, *args, **kwargs):
+        self.last_converse_kwargs = kwargs
+
+        def stream_generator():
+            for chunk in STRUCTURED_STREAM_CHUNKS:
+                yield {
+                    "contentBlockDelta": {
+                        "delta": {"text": chunk},
+                        "contentBlockIndex": 0,
+                    }
+                }
+            yield {"messageStop": {"stopReason": "end_turn"}}
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "totalTokens": 30,
+                    },
+                    "metrics": {"latencyMs": 100},
+                }
+            }
+
+        return {"stream": stream_generator()}
+
+
+class AsyncMockStructuredClient:
+    """Async mock client that returns JSON text responses."""
+
+    def __init__(self) -> None:
+        self.exceptions = MockExceptions()
+        self.last_converse_kwargs = None
+
+    async def __aenter__(self) -> "AsyncMockStructuredClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    async def converse(self, *args, **kwargs):
+        self.last_converse_kwargs = kwargs
+        return {
+            "output": {"message": {"content": [{"text": STRUCTURED_JSON_RESPONSE}]}},
+            "usage": {"inputTokens": 10, "outputTokens": 20, "totalTokens": 30},
+        }
+
+    async def converse_stream(self, *args, **kwargs):
+        self.last_converse_kwargs = kwargs
+
+        async def stream_generator():
+            for chunk in STRUCTURED_STREAM_CHUNKS:
+                yield {
+                    "contentBlockDelta": {
+                        "delta": {"text": chunk},
+                        "contentBlockIndex": 0,
+                    }
+                }
+            yield {"messageStop": {"stopReason": "end_turn"}}
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "totalTokens": 30,
+                    },
+                    "metrics": {"latencyMs": 100},
+                }
+            }
+
+        return {"stream": stream_generator()}
+
+
+class MockStructuredAsyncSession:
+    def __init__(self, *args, **kwargs) -> None:
+        self._client = AsyncMockStructuredClient()
+
+    def client(self, *args, **kwargs):
+        return self._client
+
+
+@pytest.fixture()
+def structured_mock_client():
+    return MockStructuredClient()
+
+
+@pytest.fixture()
+def structured_async_session():
+    return MockStructuredAsyncSession()
+
+
+@pytest.fixture()
+def bedrock_converse_structured(
+    structured_mock_client, structured_async_session, monkeypatch
+):
+    """Create a BedrockConverse instance with a supported model for structured output."""
+    monkeypatch.setattr("aioboto3.Session", lambda **kw: structured_async_session)
+
+    return BedrockConverse(
+        model="anthropic.claude-sonnet-4-5-20250929-v1:0",
+        max_tokens=EXP_MAX_TOKENS,
+        temperature=EXP_TEMPERATURE,
+        callback_manager=CallbackManager(),
+        client=structured_mock_client,
+    )
+
+
+@pytest.fixture()
+def bedrock_converse_unsupported(
+    structured_mock_client, structured_async_session, monkeypatch
+):
+    """Create a BedrockConverse instance with an unsupported model for structured output."""
+    monkeypatch.setattr("aioboto3.Session", lambda **kw: structured_async_session)
+
+    return BedrockConverse(
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        max_tokens=EXP_MAX_TOKENS,
+        temperature=EXP_TEMPERATURE,
+        callback_manager=CallbackManager(),
+        client=structured_mock_client,
+    )
+
+
+class TestStructuredPredict:
+    """Tests for native structured output support."""
+
+    def test_should_use_structured_outputs_supported(self, bedrock_converse_structured):
+        assert bedrock_converse_structured._should_use_structured_outputs() is True
+
+    def test_should_use_structured_outputs_unsupported(
+        self, bedrock_converse_unsupported
+    ):
+        assert bedrock_converse_unsupported._should_use_structured_outputs() is False
+
+    def test_should_use_structured_outputs_non_default_mode(
+        self, structured_mock_client, structured_async_session, monkeypatch
+    ):
+        monkeypatch.setattr("aioboto3.Session", lambda **kw: structured_async_session)
+        llm = BedrockConverse(
+            model="anthropic.claude-sonnet-4-5-20250929-v1:0",
+            max_tokens=EXP_MAX_TOKENS,
+            temperature=EXP_TEMPERATURE,
+            pydantic_program_mode=PydanticProgramMode.LLM,
+            callback_manager=CallbackManager(),
+            client=structured_mock_client,
+        )
+        assert llm._should_use_structured_outputs() is False
+
+    def test_prepare_structured_output_config(self, bedrock_converse_structured):
+        config = bedrock_converse_structured._prepare_structured_output_config(
+            SampleOutputModel
+        )
+        assert "outputConfig" in config
+        text_format = config["outputConfig"]["textFormat"]
+        assert text_format["type"] == "json_schema"
+        json_schema = text_format["structure"]["jsonSchema"]
+        assert json_schema["name"] == "SampleOutputModel"
+        # schema should be a JSON string
+        assert isinstance(json_schema["schema"], str)
+        parsed_schema = json.loads(json_schema["schema"])
+        assert "properties" in parsed_schema
+        assert "name" in parsed_schema["properties"]
+        assert "age" in parsed_schema["properties"]
+        # additionalProperties should be set to false on the top-level object
+        assert parsed_schema.get("additionalProperties") is False
+
+    def test_add_additional_properties_false(self, bedrock_converse_structured):
+        """Verify _add_additional_properties_false recursively sets the flag."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "street": {"type": "string"},
+                        "city": {"type": "string"},
+                    },
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}},
+                    },
+                },
+            },
+            "$defs": {
+                "Inner": {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}},
+                }
+            },
+        }
+        BedrockConverse._add_additional_properties_false(schema)
+        # Top-level
+        assert schema["additionalProperties"] is False
+        # Nested object
+        assert schema["properties"]["address"]["additionalProperties"] is False
+        # Object inside array items
+        assert schema["properties"]["tags"]["items"]["additionalProperties"] is False
+        # $defs
+        assert schema["$defs"]["Inner"]["additionalProperties"] is False
+        # Non-object types should NOT get additionalProperties
+        assert "additionalProperties" not in schema["properties"]["name"]
+
+    def test_structured_predict_native(self, bedrock_converse_structured):
+        prompt = PromptTemplate("Generate a person named {name}.")
+        result = bedrock_converse_structured.structured_predict(
+            SampleOutputModel, prompt, name="Alice"
+        )
+        assert isinstance(result, SampleOutputModel)
+        assert result.name == "Alice"
+        assert result.age == 30
+
+    def test_structured_predict_passes_output_config(
+        self, bedrock_converse_structured, structured_mock_client
+    ):
+        prompt = PromptTemplate("Generate a person named {name}.")
+        bedrock_converse_structured.structured_predict(
+            SampleOutputModel, prompt, name="Alice"
+        )
+        kwargs = structured_mock_client.last_converse_kwargs
+        assert kwargs is not None
+        assert "outputConfig" in kwargs
+        text_format = kwargs["outputConfig"]["textFormat"]
+        assert text_format["type"] == "json_schema"
+
+    def test_structured_predict_fallback_unsupported_model(
+        self, bedrock_converse_unsupported
+    ):
+        """Verify that unsupported models fall back to super() (function-calling)."""
+        assert bedrock_converse_unsupported._should_use_structured_outputs() is False
+
+    def test_structured_predict_fallback_non_default_mode(
+        self, structured_mock_client, structured_async_session, monkeypatch
+    ):
+        """Verify that non-DEFAULT program mode falls back."""
+        monkeypatch.setattr("aioboto3.Session", lambda **kw: structured_async_session)
+        llm = BedrockConverse(
+            model="anthropic.claude-sonnet-4-5-20250929-v1:0",
+            max_tokens=EXP_MAX_TOKENS,
+            temperature=EXP_TEMPERATURE,
+            pydantic_program_mode=PydanticProgramMode.LLM,
+            callback_manager=CallbackManager(),
+            client=structured_mock_client,
+        )
+        assert llm._should_use_structured_outputs() is False
+
+    @pytest.mark.asyncio
+    async def test_astructured_predict_native(self, bedrock_converse_structured):
+        prompt = PromptTemplate("Generate a person named {name}.")
+        result = await bedrock_converse_structured.astructured_predict(
+            SampleOutputModel, prompt, name="Alice"
+        )
+        assert isinstance(result, SampleOutputModel)
+        assert result.name == "Alice"
+        assert result.age == 30
+
+    def test_stream_structured_predict_native(self, bedrock_converse_structured):
+        prompt = PromptTemplate("Generate a person named {name}.")
+        results = list(
+            bedrock_converse_structured.stream_structured_predict(
+                SampleOutputModel, prompt, name="Alice"
+            )
+        )
+        assert len(results) > 0
+        final = results[-1]
+        assert final.name == "Alice"
+        assert final.age == 30
+
+    @pytest.mark.asyncio
+    async def test_astream_structured_predict_native(self, bedrock_converse_structured):
+        prompt = PromptTemplate("Generate a person named {name}.")
+        results = []
+        stream = await bedrock_converse_structured.astream_structured_predict(
+            SampleOutputModel, prompt, name="Alice"
+        )
+        async for partial in stream:
+            results.append(partial)
+        assert len(results) > 0
+        final = results[-1]
+        assert final.name == "Alice"
+        assert final.age == 30
+
+
+# --- Structured Predict Integration Tests ---
+
+
+@needs_aws_creds
+def test_structured_predict_integration(bedrock_converse_integration):
+    """Integration test for structured predict with native structured output."""
+
+    class Person(BaseModel):
+        """A person."""
+
+        name: str = PydanticField(description="The person's name")
+        occupation: str = PydanticField(description="The person's occupation")
+
+    prompt = PromptTemplate("Generate a fictional person who works as a {occupation}.")
+    result = bedrock_converse_integration.structured_predict(
+        Person, prompt, occupation="software engineer"
+    )
+    assert isinstance(result, Person)
+    assert len(result.name) > 0
+    assert len(result.occupation) > 0
+
+
+@needs_aws_creds
+@pytest.mark.asyncio
+async def test_astructured_predict_integration(bedrock_converse_integration):
+    """Integration test for async structured predict."""
+
+    class City(BaseModel):
+        """A city."""
+
+        name: str = PydanticField(description="Name of the city")
+        country: str = PydanticField(description="Country the city is in")
+
+    prompt = PromptTemplate("Name a famous city in {country}.")
+    result = await bedrock_converse_integration.astructured_predict(
+        City, prompt, country="France"
+    )
+    assert isinstance(result, City)
+    assert len(result.name) > 0
+    assert len(result.country) > 0
+
+
+@needs_aws_creds
+def test_stream_structured_predict_integration(bedrock_converse_integration):
+    """Integration test for streaming structured predict."""
+
+    class Animal(BaseModel):
+        """An animal."""
+
+        name: str = PydanticField(description="Name of the animal")
+        habitat: str = PydanticField(description="Where the animal lives")
+
+    prompt = PromptTemplate("Name a common animal found in {region}.")
+    results = list(
+        bedrock_converse_integration.stream_structured_predict(
+            Animal, prompt, region="Africa"
+        )
+    )
+    assert len(results) > 0
+    final = results[-1]
+    assert isinstance(final.name, str)
+    assert len(final.name) > 0

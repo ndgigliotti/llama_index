@@ -1,14 +1,18 @@
+import json
 import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncGenerator,
     Callable,
     Dict,
+    Generator,
     List,
     Literal,
     Optional,
     Sequence,
     Tuple,
+    Type,
     Union,
 )
 
@@ -39,8 +43,15 @@ from llama_index.core.llms.callbacks import (
     llm_chat_callback,
     llm_completion_callback,
 )
+import llama_index.core.instrumentation as instrument
+from llama_index.core.instrumentation.events.llm import (
+    LLMStructuredPredictEndEvent,
+    LLMStructuredPredictStartEvent,
+)
 from llama_index.core.llms.function_calling import FunctionCallingLLM, ToolSelection
+from llama_index.core.llms.llm import Model
 from llama_index.core.llms.utils import parse_partial_json
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.types import BaseOutputParser, PydanticProgramMode
 from llama_index.llms.bedrock_converse.utils import (
     ThinkingDict,
@@ -51,6 +62,7 @@ from llama_index.llms.bedrock_converse.utils import (
     force_single_tool_call,
     is_bedrock_adaptive_thinking_supported_model,
     is_bedrock_function_calling_model,
+    is_bedrock_structured_output_supported_model,
     is_reasoning,
     join_two_dicts,
     messages_to_converse_messages,
@@ -59,6 +71,8 @@ from llama_index.llms.bedrock_converse.utils import (
 
 if TYPE_CHECKING:
     from llama_index.core.tools.types import BaseTool
+
+dispatcher = instrument.get_dispatcher(__name__)
 
 
 class BedrockConverse(FunctionCallingLLM):
@@ -1000,6 +1014,233 @@ class BedrockConverse(FunctionCallingLLM):
     ) -> CompletionResponseAsyncGen:
         astream_complete_fn = astream_chat_to_completion_decorator(self.astream_chat)
         return await astream_complete_fn(prompt, **kwargs)
+
+    # -- Structured outputs --
+
+    def _should_use_structured_outputs(self) -> bool:
+        """Check if native structured outputs should be used."""
+        return (
+            self.pydantic_program_mode == PydanticProgramMode.DEFAULT
+            and is_bedrock_structured_output_supported_model(self.model)
+        )
+
+    @staticmethod
+    def _raise_on_outdated_boto3(exc: Exception) -> None:
+        """Re-raise with a helpful message if the error is due to an outdated boto3."""
+        from botocore.exceptions import ParamValidationError
+
+        if isinstance(exc, ParamValidationError) and "outputConfig" in str(exc):
+            raise ValueError(
+                "Native structured output requires boto3 >= 1.42.42. "
+                "Please upgrade: pip install --upgrade boto3"
+            ) from exc
+
+    @staticmethod
+    def _add_additional_properties_false(schema: Dict[str, Any]) -> None:
+        """
+        Recursively set additionalProperties=false on all object types.
+
+        Bedrock structured output requires this on every object in the schema,
+        similar to OpenAI's strict mode.
+        """
+        if schema.get("type") == "object":
+            schema.setdefault("additionalProperties", False)
+        for value in schema.values():
+            if isinstance(value, dict):
+                BedrockConverse._add_additional_properties_false(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        BedrockConverse._add_additional_properties_false(item)
+
+    def _prepare_structured_output_config(
+        self, output_cls: Type[Model]
+    ) -> Dict[str, Any]:
+        """Build the outputConfig dict for Bedrock Converse structured output."""
+        schema = output_cls.model_json_schema()
+        self._add_additional_properties_false(schema)
+        return {
+            "outputConfig": {
+                "textFormat": {
+                    "type": "json_schema",
+                    "structure": {
+                        "jsonSchema": {
+                            "schema": json.dumps(schema),
+                            "name": output_cls.__name__,
+                            "description": output_cls.__doc__ or "",
+                        }
+                    },
+                }
+            }
+        }
+
+    @dispatcher.span
+    def structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        """Structured predict with native structured output support."""
+        llm_kwargs = llm_kwargs or {}
+
+        if self._should_use_structured_outputs():
+            dispatcher.event(
+                LLMStructuredPredictStartEvent(
+                    output_cls=output_cls,
+                    template=prompt,
+                    template_args=prompt_args,
+                )
+            )
+            messages = self._extend_messages(prompt.format_messages(**prompt_args))
+            output_config = self._prepare_structured_output_config(output_cls)
+            llm_kwargs.update(output_config)
+            try:
+                response = self.chat(messages, **llm_kwargs)
+            except Exception as e:
+                self._raise_on_outdated_boto3(e)
+                raise
+            result = output_cls.model_validate_json(str(response.message.content))
+            dispatcher.event(LLMStructuredPredictEndEvent(output=result))
+            return result
+
+        return super().structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    @dispatcher.span
+    async def astructured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        """Async structured predict with native structured output support."""
+        llm_kwargs = llm_kwargs or {}
+
+        if self._should_use_structured_outputs():
+            dispatcher.event(
+                LLMStructuredPredictStartEvent(
+                    output_cls=output_cls,
+                    template=prompt,
+                    template_args=prompt_args,
+                )
+            )
+            messages = self._extend_messages(prompt.format_messages(**prompt_args))
+            output_config = self._prepare_structured_output_config(output_cls)
+            llm_kwargs.update(output_config)
+            try:
+                response = await self.achat(messages, **llm_kwargs)
+            except Exception as e:
+                self._raise_on_outdated_boto3(e)
+                raise
+            result = output_cls.model_validate_json(str(response.message.content))
+            dispatcher.event(LLMStructuredPredictEndEvent(output=result))
+            return result
+
+        return await super().astructured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    def _structured_stream_call(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Generator:
+        """Stream structured output call with native support."""
+        if self._should_use_structured_outputs():
+            from llama_index.core.program.streaming_utils import (
+                process_streaming_content_incremental,
+            )
+
+            messages = self._extend_messages(prompt.format_messages(**prompt_args))
+            llm_kwargs = llm_kwargs or {}
+            output_config = self._prepare_structured_output_config(output_cls)
+            llm_kwargs.update(output_config)
+            curr = None
+            try:
+                for response in self.stream_chat(messages, **llm_kwargs):
+                    curr = process_streaming_content_incremental(
+                        response, output_cls, curr
+                    )
+                    yield curr
+            except Exception as e:
+                self._raise_on_outdated_boto3(e)
+                raise
+        else:
+            yield from super()._structured_stream_call(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+
+    async def _structured_astream_call(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> AsyncGenerator:
+        """Async stream structured output call with native support."""
+        if self._should_use_structured_outputs():
+
+            async def gen() -> AsyncGenerator:
+                from llama_index.core.program.streaming_utils import (
+                    process_streaming_content_incremental,
+                )
+
+                messages = self._extend_messages(prompt.format_messages(**prompt_args))
+                _llm_kwargs = llm_kwargs or {}
+                output_config = self._prepare_structured_output_config(output_cls)
+                _llm_kwargs.update(output_config)
+                curr = None
+                try:
+                    async for response in await self.astream_chat(
+                        messages, **_llm_kwargs
+                    ):
+                        curr = process_streaming_content_incremental(
+                            response, output_cls, curr
+                        )
+                        yield curr
+                except Exception as e:
+                    self._raise_on_outdated_boto3(e)
+                    raise
+
+            return gen()
+        else:
+            return await super()._structured_astream_call(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+
+    @dispatcher.span
+    def stream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Generator:
+        """Stream structured predict."""
+        llm_kwargs = llm_kwargs or {}
+        return super().stream_structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    @dispatcher.span
+    async def astream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> AsyncGenerator:
+        """Async stream structured predict."""
+        llm_kwargs = llm_kwargs or {}
+        return await super().astream_structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
 
     def _prepare_chat_with_tools(
         self,

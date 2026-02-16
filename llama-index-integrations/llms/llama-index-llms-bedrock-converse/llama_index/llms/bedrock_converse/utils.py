@@ -194,6 +194,42 @@ BEDROCK_REASONING_MODELS = (
 
 BEDROCK_ADAPTIVE_THINKING_SUPPORTED_MODELS = ("anthropic.claude-opus-4-6-v1",)
 
+BEDROCK_STRUCTURED_OUTPUT_MODELS = (
+    # Anthropic Claude 3.5+
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "anthropic.claude-opus-4-20250514-v1:0",
+    "anthropic.claude-opus-4-1-20250805-v1:0",
+    "anthropic.claude-opus-4-5-20251101-v1:0",
+    "anthropic.claude-opus-4-6-v1",
+    "anthropic.claude-sonnet-4-20250514-v1:0",
+    "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "anthropic.claude-haiku-4-5-20251001-v1:0",
+    # Cohere Command R
+    "cohere.command-r-v1:0",
+    "cohere.command-r-plus-v1:0",
+    # Meta Llama 3.2+
+    "meta.llama3-2-1b-instruct-v1:0",
+    "meta.llama3-2-3b-instruct-v1:0",
+    "meta.llama3-2-11b-instruct-v1:0",
+    "meta.llama3-2-90b-instruct-v1:0",
+    "meta.llama3-3-70b-instruct-v1:0",
+    "meta.llama4-maverick-17b-instruct-v1:0",
+    "meta.llama4-scout-17b-instruct-v1:0",
+    # Mistral Large
+    "mistral.mistral-large-2402-v1:0",
+    "mistral.mistral-large-2407-v1:0",
+    # OpenAI GPT on Bedrock
+    "openai.gpt-oss-120b-1:0",
+    "openai.gpt-oss-20b-1:0",
+)
+
+
+def is_bedrock_structured_output_supported_model(model_name: str) -> bool:
+    return get_model_name(model_name) in BEDROCK_STRUCTURED_OUTPUT_MODELS
+
 
 def is_reasoning(model_name: str) -> bool:
     model_name = get_model_name(model_name)

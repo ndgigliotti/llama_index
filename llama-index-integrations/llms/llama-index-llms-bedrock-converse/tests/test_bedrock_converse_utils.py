@@ -23,6 +23,7 @@ from llama_index.llms.bedrock_converse.utils import (
     converse_with_retry,
     converse_with_retry_async,
     get_model_name,
+    is_bedrock_structured_output_supported_model,
     messages_to_converse_messages,
     tools_to_converse_tools,
 )
@@ -765,3 +766,75 @@ def test_thinking_dict_adaptive_no_budget():
     td: ThinkingDict = {"type": "adaptive"}
     assert td["type"] == "adaptive"
     assert "budget_tokens" not in td
+
+
+class TestStructuredOutputModelSupport:
+    """Tests for is_bedrock_structured_output_supported_model."""
+
+    def test_supported_anthropic_models(self):
+        assert is_bedrock_structured_output_supported_model(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "anthropic.claude-3-7-sonnet-20250219-v1:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "anthropic.claude-opus-4-6-v1"
+        )
+
+    def test_supported_cohere_models(self):
+        assert is_bedrock_structured_output_supported_model("cohere.command-r-v1:0")
+        assert is_bedrock_structured_output_supported_model(
+            "cohere.command-r-plus-v1:0"
+        )
+
+    def test_supported_meta_models(self):
+        assert is_bedrock_structured_output_supported_model(
+            "meta.llama3-2-90b-instruct-v1:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "meta.llama3-3-70b-instruct-v1:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "meta.llama4-maverick-17b-instruct-v1:0"
+        )
+
+    def test_supported_mistral_models(self):
+        assert is_bedrock_structured_output_supported_model(
+            "mistral.mistral-large-2407-v1:0"
+        )
+
+    def test_supported_openai_models(self):
+        assert is_bedrock_structured_output_supported_model("openai.gpt-oss-120b-1:0")
+
+    def test_region_prefixed_models(self):
+        assert is_bedrock_structured_output_supported_model(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "eu.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )
+        assert is_bedrock_structured_output_supported_model(
+            "apac.meta.llama3-3-70b-instruct-v1:0"
+        )
+
+    def test_unsupported_claude_3_models(self):
+        assert not is_bedrock_structured_output_supported_model(
+            "anthropic.claude-3-sonnet-20240229-v1:0"
+        )
+        assert not is_bedrock_structured_output_supported_model(
+            "anthropic.claude-3-haiku-20240307-v1:0"
+        )
+        assert not is_bedrock_structured_output_supported_model(
+            "anthropic.claude-3-opus-20240229-v1:0"
+        )
+
+    def test_unsupported_nova_models(self):
+        assert not is_bedrock_structured_output_supported_model("amazon.nova-pro-v1:0")
+        assert not is_bedrock_structured_output_supported_model("amazon.nova-lite-v1:0")
+
+    def test_unsupported_deepseek_model(self):
+        assert not is_bedrock_structured_output_supported_model("deepseek.r1-v1:0")
